@@ -19,6 +19,9 @@ import json
 import os
 import subprocess
 
+import conffwk
+import confmodel
+
 from socket import gethostname
 
 from rich import print
@@ -243,7 +246,7 @@ def assign_cores_tpproc(cores : CoreList, numa : int, n_cores : int) -> list[int
         list[int]: list of assigned cores.
     """
     if cores.num_regions(numa) == 1:
-        assigned_cores = [cores[cores.first_available(numa)] for i in range(n_cores)]
+        assigned_cores = [cores[cores.first_available(numa, 0)] for i in range(n_cores)]
     else:
         remaining = n_cores
         assigned_cores = []
@@ -268,7 +271,7 @@ def assign_cores_default(cores : CoreList, numa : int, n_cores : int) -> list[in
         list[int]: list of assigned cores.
     """
     if cores.num_regions(numa) == 1:
-        cores = cores.alt_range(n_cores, numa)
+        cores = cores.alt_range(n_cores, numa, 0)
     else:
         cores = cores.alt_range(n_cores//2, numa, 0) + cores.alt_range(n_cores//2, numa, 1)
     return cores
@@ -286,7 +289,7 @@ def assign_cores_recording(cores : CoreList, numa : int, n_cores : int) -> list[
         list[int]: list of assigned cores.
     """
     if cores.num_regions(numa) == 1:
-        assigned_cores = cores.range(cores.core_list_regions[numa][-1] - (n_cores - 1), cores.core_list_regions[numa][-1] + 1, numa)
+        assigned_cores = cores.range(cores.core_list_regions[numa][0][-1] - (n_cores - 1), cores.core_list_regions[numa][0][-1] + 1, numa, 0)
     else:
         n_cores = n_cores // cores.num_regions(numa)
         remainder = n_cores % cores.num_regions(numa)
@@ -300,13 +303,13 @@ def assign_cores_recording(cores : CoreList, numa : int, n_cores : int) -> list[
     return assigned_cores
 
 
-def fill_pinning(pinning : dict, cores : CoreList, n_cores : dict[int]) -> dict:
+def fill_pinning(pinning : dict, cores : CoreList, n_cores : dict[int], oks_info : dict[tuple]) -> dict:
     """ Assign the cores to the CPU pinning based on the rules for each specific thread type.
 
     Args:
         pinning (dict): Pinning dictionary.
         cores (CoreList): List of cores to use when assigning.
-        n_cores (dict[int]): number of cores to add for each thread type.
+        n_cores (dict[int]): Number of cores to add for each thread type.
 
     Raises:
         Exception: Thread type not known (so it is unknown how the cores should be assigned to this thread).
@@ -315,18 +318,21 @@ def fill_pinning(pinning : dict, cores : CoreList, n_cores : dict[int]) -> dict:
         dict: Filled pinning dictionary.
     """
     for apps in pinning["daq_application"]:
-        if not apps[-2:].isalpha():
-            numa = int(apps[-1])
-        else:
-            numa = int(apps[-2])
+        numa = oks_info[apps.split("--name ")[-1]][1]
+        lcores = oks_info[apps.split("--name ")[-1]][0]
 
         ccp_cores = None
         rawproc_cores = None
+
+        for i in lcores:
+            pinning["daq_application"][apps]["threads"][f"rte-worker-{i}"] = str(i)
+
         for t in pinning["daq_application"][apps]["threads"]:
             if ("tpproc" in t) or ("tpset" in t):
                 pinning["daq_application"][apps]["threads"][t] = core_list_to_str(assign_cores_tpproc(cores, numa, n_cores["tpproc"]))
             elif "rte-worker" in t:
-                pinning["daq_application"][apps]["threads"][t] = str(cores[int(t.split("-")[-1])]) # rte worker lcores are assigned in the OKS configuration, so these are already pre-defined.
+                continue
+            #     pinning["daq_application"][apps]["threads"][t] = str(cores[int(t.split("-")[-1])]) # rte worker lcores are assigned in the OKS configuration, so these are already pre-defined.
             elif ("rawproc" in t) or ("postproc" in t):
                 if rawproc_cores is None:
                     rawproc_cores = core_list_to_str(assign_cores_default(cores, numa, n_cores["rawproc"]))
@@ -386,7 +392,7 @@ def main(args = argparse.Namespace):
         elif len(region_boundaries) == 0:
             print("only one region was found")
             n_regions = 1
-            numa_dict[numa]["regions"] = cores
+            numa_dict[numa]["regions"] = [cores]
         else:
             n_regions = 2
             numa_dict[numa]["regions"] = [cores[:region_boundaries[0]], cores[region_boundaries[0]:]]
@@ -398,10 +404,31 @@ def main(args = argparse.Namespace):
     max_cores = {k : getattr(args, k) for k in max_cores_default}
 
     #! this should be read from the oks config
-    pinning = {"daq_application" : {}}
-    app_names = []
+    db = conffwk.Configuration("oksconflibs:" + args.oks_file)
+
     with open(args.template, "r") as f:
         template = json.load(f)
+
+    readout = db.get_dals(class_name = "ReadoutApplication")
+
+    app_info = {}
+    for k, v in template["daq_application"].items():
+        app_name = k.split("--name ")[-1]
+
+        for ru in readout:
+            if app_name != ru.id:
+                continue
+            else:
+                resources = ru.get("ProcessingResource")
+                for r in resources:
+                    if ("lcore" in r.id):
+                        lcores = r.cpu_cores
+                        numa = r.numa_id
+                        break
+            app_info[app_name] = (lcores, numa)
+
+    pinning = {"daq_application" : {}}
+    app_names = []
 
     for k, v in template["daq_application"].items():
         app_names.append(k)
@@ -414,13 +441,12 @@ def main(args = argparse.Namespace):
             for t in v["threads"]:
                 pinning["daq_application"][k]["threads"][t] = None
 
-
     # remove first thread and hypercore on each numa node
     if n_regions == 1:
-        cores_remaining.remove(numa_dict["0"]["regions"][0])
-        cores_remaining.remove(numa_dict["1"]["regions"][0])
-        remaining_regions[0].pop(0)
-        remaining_regions[1].pop(0)
+        cores_remaining.remove(numa_dict["0"]["regions"][0][0])
+        cores_remaining.remove(numa_dict["1"]["regions"][0][0])
+        remaining_regions[0][0].pop(0)
+        remaining_regions[1][0].pop(0)
 
     else: # must have hypercores
         cores_remaining.remove(numa_dict["0"]["regions"][0][0])
@@ -436,7 +462,7 @@ def main(args = argparse.Namespace):
     # make the pinning configuration for running with the DAQ
     cores = CoreList(copy.deepcopy(cores_remaining), copy.deepcopy(remaining_regions))
 
-    fill_pinning(pinning, cores, max_cores) # create pinning for running
+    fill_pinning(pinning, cores, max_cores, app_info) # create pinning for running
 
     # print created pinning and remaning cores that were not assigned (excluding the first core in each region.)
     print(pinning)
@@ -449,8 +475,9 @@ def main(args = argparse.Namespace):
     app_names = list(pinning["daq_application"].keys())
 
     for k in pinning_pre_conf["daq_application"]:
-        numa = int(k.split("eth")[-1][0])
-        pinning_pre_conf["daq_application"][k]["parent"] = core_list_to_str([j for numa in cores.core_list_regions[numa] for j in numa])
+        numa = app_info[k.split("--name ")[-1]][1]
+        # numa = int(k.split("eth")[-1][0])
+        pinning_pre_conf["daq_application"][k]["parent"] = core_list_to_str([j for i in cores.core_list_regions[numa] for j in i])
 
     # write to a json file
     for p, n in zip([pinning, pinning_pre_conf],["cpupin-all-running.json", "cpupin-all.json"]):
@@ -474,6 +501,7 @@ if __name__ == "__main__":
     parser.add_argument("-t", "--template", type = str, help = "pinning file template. must be a json file.", required = True)
     parser.add_argument("-r", "--readout_server", type = str, default = gethostname(), help = "hostname for the machine, if not provided the current machine hostname is used.")
     parser.add_argument("-f", "--fake", action="store_true", help = "fake the numactl output for the specified readout machine.")
+    parser.add_argument("-o", "--oks-file", type = str, help = "oks session file.", required = True)
 
     for k, v in max_cores_default.items():
         if k == "ccp":
