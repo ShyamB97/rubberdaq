@@ -138,7 +138,8 @@ def get_info(devices : list[str]):
           if numa_dict[k]["devices"][j][0] == ":".join(pci_addr.split(":")[1:]):
             numa_dict[k]["devices"][j] = (pci_addr, i)
 
-  return {"dev" : dev_dict, "raid" : raid_dict, "nvme" : nvme_dict, "numa" : numa_dict}
+  hostname = run_cmd(["hostname"])[0]
+  return {"host" : hostname, "dev" : dev_dict, "raid" : raid_dict, "nvme" : nvme_dict, "numa" : numa_dict}
 
 
 def main(args : argparse.Namespace):

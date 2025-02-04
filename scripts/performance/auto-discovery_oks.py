@@ -77,20 +77,22 @@ class Node(Resource):
 
 class Host:
   """ A host, which is a collection of Resources. """
-  raid : list[Resource] = []
-  numa : list[Resource] = []
+  name : str
+  raid : list[RAID]
+  numa : list[Node]
 
   def __repr__(self):
     return str(vars(self))
 
-  def __init__(self):
-    self.raid = []
-    self.numa = []
+  def __init__(self, name : str, raid : list[RAID] = [], numa : list[Node] = []):
+    self.name = name
+    self.raid = raid
+    self.numa = numa
 
 
 def main(args : argparse.Namespace):
   info = auto_discovery.get_info(['Ethernet', 'Non-Volatile', 'Xilinx', 'CERN'])
-  host = Host()
+  host = Host(info["host"])
 
   for r in info["raid"].values():
     host.raid.append(RAID(r["device"].split("-> ")[-1], r["symlink"], r["drives"]))
