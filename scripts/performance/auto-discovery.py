@@ -41,9 +41,9 @@ def run_cmd(cmd : list[str]):
     print(f"{cmd} ran with error: {err.output.decode('utf-8')}")
 
 
-def main(args : argparse.Namespace):
+def get_info(devices : list[str]):
   dev_dict = {}
-  for dev in args.device:
+  for dev in devices:
     dev_dict[dev] = {}
 
   ##### Check NUMA
@@ -55,7 +55,7 @@ def main(args : argparse.Namespace):
     for item in lspci_out:
       devl = item.split(' ')
       devl[1:len(devl)] = [' '.join(devl[1:len(devl)])]
-      for dev in args.device:
+      for dev in devices:
         if devl[1].find(dev) != -1:
           dev_dict[dev][devl[0]] = devl
           verbose_info = run_cmd(["lspci", "-s", devl[0], "-vvvvv"])
@@ -125,7 +125,26 @@ def main(args : argparse.Namespace):
       if part.device == raid_dict[raid]['device']:
         raid_dict[raid]['mount'] = part.mountpoint
         raid_dict[raid]['usage'] = psutil.disk_usage(part.mountpoint)
-    
+
+  # Network
+  lshw_out = "".join(run_cmd(["lshw", "-C", "Network", "-C", "Storage", "-json"])).split("[")[-1].split("]")[0]
+  lshw_out = json.loads("[" + lshw_out + "]")
+
+  for i in lshw_out:
+    if "pci" in i["businfo"]:
+      pci_addr = "".join(i["businfo"].split("@")[-1])
+      for k in numa_dict:
+        for j in range(len(numa_dict[k]["devices"])):
+          if numa_dict[k]["devices"][j][0] == ":".join(pci_addr.split(":")[1:]):
+            numa_dict[k]["devices"][j] = (pci_addr, i)
+
+  return {"dev" : dev_dict, "raid" : raid_dict, "nvme" : nvme_dict, "numa" : numa_dict}
+
+
+def main(args : argparse.Namespace):
+
+  info = get_info(args.device)
+
   #### Check essentials (e.g.: services on/off)
   # Check for irqbalance stopped
   # Check for numad stopped
@@ -133,13 +152,13 @@ def main(args : argparse.Namespace):
   #fstrim_out_raw = check_output()
 
   ##### Print info
-  dev_cat = dev_dict.keys()
+  dev_cat = info["dev"].keys()
   if args.verbose:
     print('#### PCIe devices')
     print('Looked up device names in lspci:', dev_cat)
     print('Found devices:')
     for cat in dev_cat:
-      dev_ids = dev_dict[cat].keys()
+      dev_ids = info["dev"][cat].keys()
       print('Category', cat, ':', len(dev_ids))
       print('  -> lspci ids:', str(dev_ids))
 
@@ -150,36 +169,36 @@ def main(args : argparse.Namespace):
   print('  -> Logical CPU count:', lcpu_count)
   print('  -> Physical CPU count:', pcpu_count)
 
-  if numa_nodes:
-    print('  -> NUMA nodes:', numa_nodes)
+  if len(info["numa"]) > 0:
+    print('  -> NUMA nodes:', len(info["numa"]))
   else:
     print("NUMA nodes was not found")
 
-  for numa in numa_dict:
-    if ("cpus" not in numa_dict[numa]):
+  for numa in info["numa"]:
+    if ("cpus" not in info["numa"][numa]):
       print("cpus for each NUMA node could not be found")
       continue
-    print('   * CPUs node', numa, *numa_dict[numa]['cpus'])
-    print('   * size node', numa, numa_dict[numa]['size'])
-    print('   * free node', numa, numa_dict[numa]['free'])
-    print('   * devs node', numa, json.dumps(numa_dict[numa]['devices'], indent=4))
+    print('   * CPUs node', numa, *info["numa"][numa]['cpus'])
+    print('   * size node', numa, info["numa"][numa]['size'])
+    print('   * free node', numa, info["numa"][numa]['free'])
+    print('   * devs node', numa, json.dumps(info["numa"][numa]['devices'], indent=4))
 
   print('#### Memory status:\n', vmem)
 
-  if len(raid_dict) == 0:
+  if len(info["raid"]) == 0:
     print("no RAID devices were found.")
   else:
-    print('#### RAID status:\n', raid_dict)
+    print('#### RAID status:\n', info["raid"])
 
   if args.verbose:
     print('#### NVMe drives:')
-    print(json.dumps(nvme_dict, sort_keys=True, indent=4))
+    print(json.dumps(info["nvme"], sort_keys=True, indent=4))
 
     print('#### RAID devices:')
-    print(json.dumps(raid_dict, sort_keys=False, indent=4)) 
+    print(json.dumps(info["raid"], sort_keys=False, indent=4)) 
 
     print('#### Full NUMA map')
-    print(json.dumps(numa_dict, sort_keys=False, indent=4))
+    print(json.dumps(info["numa"], sort_keys=False, indent=4))
 
   if args.diag:
     print('Should run diagnostics...')
