@@ -16,8 +16,11 @@ Description: Create a cpu pinning file for a readout server.
 import argparse
 import copy
 import json
-import os
-import subprocess
+
+import utils
+import llc_domain_parser
+
+from dataclasses import dataclass
 
 from socket import gethostname
 
@@ -147,43 +150,6 @@ class CoreList:
             return 1
 
 
-def run_command(host : str, cmd : str) -> subprocess.CompletedProcess:
-    """ Run bash command on a given host.
-
-    Args:
-        host (str): Host name.
-        cmd (str): Command to run.
-
-    Returns:
-        subprocess.CompletedProcess: Output of command. 
-    """
-    return subprocess.run(['ssh', f'{os.environ["USER"]}@{host}', f'{cmd}'], capture_output = True)
-
-
-def parse_output(output: subprocess.CompletedProcess, separator : str = None) -> list | dict:
-    """ Get output from run_command and apply some simple formatting.
-
-    Args:
-        output (subprocess.CompletedProcess): Subprocess output.
-        separator (str, optional): String separator to split key-value pairs. Defaults to None.
-
-    Returns:
-        list | dict: _description_
-    """
-    output_lines = str(output.stdout)[2:].split("\\n")
-
-    if separator:
-        parsed = {}
-        for i in output_lines:
-            info = i.split(separator)
-            if len(info) > 1:
-                parsed[info[0]] = info[1].replace("  ", "")
-
-        return parsed
-    else:
-        return output_lines
-
-
 def get_numa_info(host : str) -> tuple[dict, int]:
     """ Get CPU information needed to make the pinning file.
 
@@ -196,7 +162,7 @@ def get_numa_info(host : str) -> tuple[dict, int]:
     numa_dict = {}
     numa_nodes = None
 
-    numactl_out = parse_output(run_command(host, "numactl -H"))
+    numactl_out = utils.parse_output(utils.run_command(host, "numactl -H"))
     if numactl_out:
         for numal in numactl_out:
             if numal.find('cpus') != -1:
@@ -344,7 +310,25 @@ def fill_pinning(pinning : dict, cores : CoreList, n_cores : dict[int]) -> dict:
     return pinning
 
 
-def main(args = argparse.Namespace):
+def load_template(template_file : str) -> dict:
+    #! this should be read from the oks config
+    pinning = {"daq_application" : {}}
+    with open(template_file, "r") as f:
+        template = json.load(f)
+
+    for k, v in template["daq_application"].items():
+        pinning["daq_application"][k] = {}
+
+        if "parent" in v:
+            pinning["daq_application"][k]["parent"] = None
+        if "threads" in v:
+            pinning["daq_application"][k]["threads"] = {}
+            for t in v["threads"]:
+                pinning["daq_application"][k]["threads"][t] = None
+    return pinning
+
+
+def cpu_pin_numa_only(args : argparse.Namespace):
     numa_dict = get_numa_info(args.readout_server)[0]
 
     #* this is just to emulate the numactl output for np0x machines for testing purposes
@@ -397,23 +381,7 @@ def main(args = argparse.Namespace):
     # how many cores should be assigned to a single thread (sharing rules are omitted here). Taken from np04-srv-031 pinning
     max_cores = {k : getattr(args, k) for k in max_cores_default}
 
-    #! this should be read from the oks config
-    pinning = {"daq_application" : {}}
-    app_names = []
-    with open(args.template, "r") as f:
-        template = json.load(f)
-
-    for k, v in template["daq_application"].items():
-        app_names.append(k)
-        pinning["daq_application"][k] = {}
-
-        if "parent" in v:
-            pinning["daq_application"][k]["parent"] = None
-        if "threads" in v:
-            pinning["daq_application"][k]["threads"] = {}
-            for t in v["threads"]:
-                pinning["daq_application"][k]["threads"][t] = None
-
+    pinning = load_template(args.template)
 
     # remove first thread and hypercore on each numa node
     if n_regions == 1:
@@ -446,7 +414,6 @@ def main(args = argparse.Namespace):
     cores = CoreList(copy.deepcopy(cores_remaining), copy.deepcopy(remaining_regions))
     pinning_pre_conf = copy.deepcopy(pinning)
 
-    app_names = list(pinning["daq_application"].keys())
 
     for k in pinning_pre_conf["daq_application"]:
         numa = int(k.split("eth")[-1][0])
@@ -458,6 +425,237 @@ def main(args = argparse.Namespace):
             json.dump(p, f, indent = 4)
 
         print(f"pinning has been written to {n}")
+
+    return
+
+
+class ElementList:
+    def __init__(self, elements : list, domain_map):
+        self.elements = elements
+        self.map = domain_map
+        return
+
+
+    def __getitem__(self, i : int):
+        e = self.elements[i]
+        self.elements.remove(e)
+        if self.map: self.map.remove(e)
+        return e
+
+
+    def get_id(self, i : int):
+        for e in self.elements:
+            if e.id == i:
+                self.elements.remove(e)
+                self.map.remove(e)
+                return e
+        raise Exception(f"Element with id {i} was not found!")
+
+    @property
+    def first(self):
+        return self.__getitem__(0)
+
+
+    def __len__(self):
+        return len(self.elements)
+
+
+@dataclass
+class Element:
+    id : int
+    children : list[int] # only keep the ID not the object itself
+    parent : "Element"
+    type : str = None
+
+    def __repr__(self):
+        return f"{self.type}(id : {self.id}, children : {len(self.children) if self.children else None}, parent : {self.parent})"
+
+
+    def get_type(self, type : str):
+        cores = []
+        if self.children:
+            for c in self.children:
+                if c.type == type:
+                    cores.append(c)
+                else:
+                    cores.extend(c.get_type(type))
+        return cores
+
+
+def assign_element_type(e : Element):
+    # code asssumes all children are the same type (which should be true)
+    if not e.parent:
+        e.type = "Socket" # we are at the highest level
+    elif not e.children:
+        e.type == "PU" # we are at the lowest level
+    elif e.children[0].type == "PU":
+        e.type = "Core"
+    elif e.children[0].type == "Core":
+        e.type = "Cache"
+    elif e.children[0].type == "Cache":
+        e.type = "NUMA"
+    elif e.children[0].type == None:
+        pass
+    else:
+        raise Exception(f"do not know how to interpret Element with type: {e.type}")
+    return
+
+
+def nest_loop(container, parent : Element = None, element_list : list = []):
+    if type(container) == dict:
+        for item in container.items():
+            if hasattr(item[1], "__iter__"):
+                e = Element(item[0], [], parent)
+                if parent: parent.children.append(e)
+                element_list.append(e)
+                nest_loop(item[1], e, element_list)
+                assign_element_type(e)
+
+                #* loop through all items, and return list of elements who are children of this item
+                #* assign the parent to each child
+                #* add elements to a flat list
+
+    else: # assume list-like
+        for item in container:
+            if hasattr(item, "__iter__"):
+                e = Element(None, [], parent)
+                if parent: parent.children.append(e)
+                element_list.append(e)
+                nest_loop(item)
+                assign_element_type(e)
+            else:
+                e = Element(item, None, parent, "PU") # this is the deepest part of the map
+                parent.children.append(e) # add child to parent
+                element_list.append(e) # add element to flat list
+                assign_element_type(e)
+    return
+
+
+class CoreMap:
+    def __init__(self, domain_map : dict):
+        self.elements = []
+        nest_loop(domain_map, element_list = self.elements)
+
+        unique_types = []
+        for e in self.elements:
+            if e.type not in unique_types:
+                unique_types.append(e.type)
+        for t in unique_types:
+            self.__make_func__(t)
+
+        self.__offset_core_id__()
+
+        return
+
+
+    def __make_func__(self, type : str) -> callable:
+        def func(self) -> ElementList:
+            return ElementList([i for i in self.elements if i.type == type], self)
+        setattr(CoreMap, type.lower(), property(func))
+
+
+    def __offset_core_id__(self):
+        offset = len(self.core) // len(self.socket)
+        for c in self.core.elements:
+            c.id = c.id + c.parent.parent.parent.id * offset
+        return
+
+
+    def remove(self, e : Element, remove_from_parent : bool = True):
+        #* remove any reference to another element: find its parent, and remove self from children
+        #* remove any reference to another element: find its children, and remove self from parent
+        #* remove self from elements
+
+        if e.children:
+            for c in e.children:
+                self.remove(c, False)
+
+        self.elements.remove(e)
+        if remove_from_parent: e.parent.children.remove(e)
+        return
+
+
+def assign_cores_map(core_map : CoreMap, numa_region : Element, max_cores : int):
+    pus = []
+    while len(pus) < max_cores:
+        tpproc_core = ElementList(numa_region.get_type("Core"), core_map).first
+        pus.extend([c.id for c in tpproc_core.children])
+    return pus
+
+def fill_pinning_map(pinning : dict, max_cores : dict, core_map : CoreMap) -> dict:
+
+    # First exclude the first core (first two processing units) in each numa region
+    for n in core_map.numa.elements:
+        core_map.core.get_id(min([c.id for c in n.get_type("Core")]))
+
+    for app in pinning["daq_application"]:
+        if not app[-2:].isalpha():
+            numa = int(app[-1])
+        else:
+            numa = int(app[-2])
+
+        for numa_region in core_map.numa.elements: # get the nume region, but do not remove it from the map yet
+            if numa_region.id == numa: break
+
+        rawprocs = None
+        ccps = None
+        for t in pinning["daq_application"][app]["threads"]:
+            # print(t)
+            # print(numa_region.get_type("PU"))
+            if "rte-worker" in t:
+                #! probably add some checks here: makre sure lcores are from the numa region, keep track of the cache id for each lcore
+                pu = int(t.split("-")[-1])
+                pinning["daq_application"][app]["threads"][t] = str(pu)
+                core_map.pu.get_id(pu)
+
+            elif "tpproc" in t:
+                tpprocs = assign_cores_map(core_map, numa_region, max_cores["tpproc"])
+                pinning["daq_application"][app]["threads"][t] = core_list_to_str(tpprocs)
+
+            elif "rawproc" in t:
+                if rawprocs is None:
+                    rawprocs = assign_cores_map(core_map, numa_region, max_cores["rawproc"])
+                pinning["daq_application"][app]["threads"][t] = core_list_to_str(rawprocs)
+
+            elif ("cleanup" in t) or ("consumer" in t) or ("periodic" in t):
+                if ccps is None:
+                    ccps = assign_cores_map(core_map, numa_region, max_cores["ccp"])                
+                pinning["daq_application"][app]["threads"][t] = core_list_to_str(ccps)
+
+            elif "recording" in t:
+                recording = assign_cores_map(core_map, numa_region, max_cores["recording"])
+                pinning["daq_application"][app]["threads"][t] = core_list_to_str(recording)
+
+            else:
+                raise Exception(f"do not know how to assign cores to thread {t}")
+        
+        pinning["daq_application"][app]["parent"] = core_list_to_str(rawprocs + ccps)
+
+    print(pinning)
+
+    return pinning
+
+
+def main(args = argparse.Namespace):
+    cm = CoreMap(llc_domain_parser.create_llc_domain_map(args.readout_server))
+
+    pus_numa = [[p.id for p in n.get_type("PU")] for n in cm.numa.elements]
+
+    # how many cores should be assigned to a single thread (sharing rules are omitted here). Taken from np04-srv-031 pinning
+    max_cores = {k : getattr(args, k) for k in max_cores_default}
+
+    pinning = load_template(args.template)
+    pinning = fill_pinning_map(pinning, max_cores, cm)
+
+    pinning_conf = copy.deepcopy(pinning)
+    for app in pinning_conf["daq_application"]:
+        if not app[-2:].isalpha():
+            numa = int(app[-1])
+        else:
+            numa = int(app[-2])
+        pinning_conf["daq_application"][app]["parent"] = core_list_to_str(pus_numa[numa])
+
+    print(pinning_conf) 
 
     return
 
