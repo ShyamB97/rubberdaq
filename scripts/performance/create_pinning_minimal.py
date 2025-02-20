@@ -21,7 +21,6 @@ import argparse
 import copy
 import json
 
-import utils
 import llc_domain_parser
 
 from dataclasses import dataclass
@@ -124,7 +123,10 @@ class CoreMap:
                 self.remove(c, False)
 
         self.elements.remove(e)
-        if remove_from_parent: e.parent.children.remove(e)
+        if remove_from_parent:
+            if e in e.parent.children:
+                e.parent.children.remove(e)
+        if len(e.parent.children) == 0: self.remove(e.parent)
         return
 
 
@@ -218,6 +220,78 @@ def assign_cores_map(core_map : CoreMap, numa_region : Element, max_cores : int)
     return pus
 
 
+def assign_cores(core_map : CoreMap, cores : list[Element], max_cores : int) -> list[int]:
+    pus = []
+    while len(pus) < max_cores:
+        next_core = ElementList(cores, core_map).first
+        pus.extend([c.id for c in next_core.children])
+    return pus
+
+
+def fill_piining_map_cache(pinning : dict, max_cores : dict, core_map : CoreMap) -> dict:
+    # First exclude the first core (first two processing units) in each numa region
+    for n in core_map.numa.elements:
+        core_map.core.get_id(min([c.id for c in n.get_type("Core")]))
+
+    for app in pinning["daq_application"]:
+        if not app[-2:].isalpha():
+            numa = int(app[-1])
+        else:
+            numa = int(app[-2])
+
+        for numa_region in core_map.numa.elements: # get the nume region, but do not remove it from the map yet
+            if numa_region.id == numa: break
+
+        # before assigning the other cores, assign rtes first as these are provided by the configuration
+        for t in pinning["daq_application"][app]["threads"]:
+            if "rte-worker" in t:
+                #! probably add some checks here: makre sure lcores are from the numa region, keep track of the cache id for each lcore
+                pu = int(t.split("-")[-1])
+                pinning["daq_application"][app]["threads"][t] = str(pu)
+                core_map.pu.get_id(pu)
+
+
+        caches = numa_region.get_type("Cache")
+        if len(caches) == 1:
+            print("Info: NUMA region has only one cache domain.")
+            readout_cache = caches[0]
+            tp_cache = caches[0]
+            readout_cache = caches[0]
+            ccp_parent_cache = caches[0]
+            available_cores_readout = caches[0].children
+        else:
+            #! cache assignment to thread is hardcoded right now
+            readout_cache = [caches.pop(0), caches.pop(0)]
+            tp_cache = caches.pop(0)
+            ccp_parent_cache = caches.pop(0)
+            available_cores_readout = readout_cache[0].children + readout_cache[1].children
+
+        ccps = None
+        for t in pinning["daq_application"][app]["threads"]:
+            if "rte-worker" in t: # this assignment happens before taking cache domains into account, as lcores are defined by the configuration
+                continue
+            elif ("rawproc" in t) or ("recording" in t):
+                    prefix = t.split("-")[0]
+                    pus = assign_cores(core_map, available_cores_readout, max_cores[prefix])
+                    pinning["daq_application"][app]["threads"][t] = core_list_to_str(pus)
+            elif "tpproc" in t:
+                    pus = assign_cores(core_map, tp_cache.children, max_cores["tpproc"])
+                    pinning["daq_application"][app]["threads"][t] = core_list_to_str(pus)
+            elif ("cleanup" in t) or ("consumer" in t) or ("periodic" in t):
+                if ccps is None:
+                    ccps = assign_cores(core_map, ccp_parent_cache.children, max_cores["ccp"])
+                pinning["daq_application"][app]["threads"][t] = core_list_to_str(ccps)
+            else:
+                raise Exception(f"do not know how to assign cores to thread {t}")
+        
+        pinning["daq_application"][app]["parent"] = core_list_to_str(ccps)
+        print(numa_region.get_type("Core"))
+
+    print(pinning)
+
+    return pinning
+
+
 def fill_pinning_map(pinning : dict, max_cores : dict, core_map : CoreMap) -> dict:
 
     # First exclude the first core (first two processing units) in each numa region
@@ -255,7 +329,7 @@ def fill_pinning_map(pinning : dict, max_cores : dict, core_map : CoreMap) -> di
 
             elif ("cleanup" in t) or ("consumer" in t) or ("periodic" in t):
                 if ccps is None:
-                    ccps = assign_cores_map(core_map, numa_region, max_cores["ccp"])                
+                    ccps = assign_cores_map(core_map, numa_region, max_cores["ccp"])
                 pinning["daq_application"][app]["threads"][t] = core_list_to_str(ccps)
 
             elif "recording" in t:
@@ -266,8 +340,6 @@ def fill_pinning_map(pinning : dict, max_cores : dict, core_map : CoreMap) -> di
                 raise Exception(f"do not know how to assign cores to thread {t}")
         
         pinning["daq_application"][app]["parent"] = core_list_to_str(rawprocs + ccps)
-
-    print(pinning)
 
     return pinning
 
@@ -281,7 +353,10 @@ def main(args = argparse.Namespace):
     max_cores = {k : getattr(args, k) for k in max_cores_default}
 
     pinning = load_template(args.template)
-    pinning = fill_pinning_map(pinning, max_cores, cm)
+    if args.cache_aware:
+        pinning = fill_piining_map_cache(pinning, max_cores, cm)
+    else:
+        pinning = fill_pinning_map(pinning, max_cores, cm)
 
     pinning_conf = copy.deepcopy(pinning)
     for app in pinning_conf["daq_application"]:
@@ -291,7 +366,13 @@ def main(args = argparse.Namespace):
             numa = int(app[-2])
         pinning_conf["daq_application"][app]["parent"] = core_list_to_str(pus_numa[numa])
 
-    print(pinning_conf) 
+    print(pinning_conf)
+
+    for p, n in zip([pinning, pinning_conf],["cpupin-all-running.json", "cpupin-all.json"]):
+        with open(n, "w") as f:
+            json.dump(p, f, indent = 4)
+
+        print(f"pinning has been written to {n}")
 
     return
 
@@ -307,7 +388,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser("Generate a pinning file for a readout machine.")
     parser.add_argument("-t", "--template", type = str, help = "pinning file template. must be a json file.", required = True)
     parser.add_argument("-r", "--readout_server", type = str, default = gethostname(), help = "hostname for the machine, if not provided the current machine hostname is used.")
-    parser.add_argument("-f", "--fake", action="store_true", help = "fake the numactl output for the specified readout machine.")
+    parser.add_argument("-c", "--cache_aware", action="store_true", help = "make a pinning file taking cache domains into account.")
 
     for k, v in max_cores_default.items():
         if k == "ccp":
