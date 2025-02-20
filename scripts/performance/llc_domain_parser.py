@@ -26,7 +26,7 @@ def search_elem(elem : ET.ElementTree | ET.Element, type : str) -> ET.Element:
 def create_cache_map(parent : ET.Element) -> dict:
 
     caches = {}
-    for cache in search_elem(parent, "L3Cache"): # get the L£ cache domains in the parent element
+    for cache in search_elem(parent, "L3Cache"): # get the L3 cache domains in the parent element
         c = int(cache.attrib["gp_index"])
         caches[c] = {}
         for core in search_elem(cache, "Core"): # cores in each cache
@@ -70,7 +70,7 @@ def main(args : argparse.Namespace):
     return
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser("Get CPU topology of a computer includinf NUMA and L3 cache domains.")
+    parser = argparse.ArgumentParser("Get CPU topology of a computer including NUMA and L3 cache domains.")
     parser.add_argument("server", type = str)
     args = parser.parse_args()
     print(args)
