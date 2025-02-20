@@ -127,8 +127,9 @@ def get_info(devices : list[str]):
         raid_dict[raid]['usage'] = psutil.disk_usage(part.mountpoint)
 
   # Network
-  lshw_out = "".join(run_cmd(["lshw", "-C", "Network", "-C", "Storage", "-json"])).split("[")[-1].split("]")[0]
-  lshw_out = json.loads("[" + lshw_out + "]")
+  lshw_out = run_cmd(["lshw", "-C", "Network", "-C", "Storage", "-json"])
+  lshw_out = "".join([i for i in lshw_out if "WARNING:" not in i])
+  lshw_out = json.loads(lshw_out)
 
   for i in lshw_out:
     if "pci" in i["businfo"]:

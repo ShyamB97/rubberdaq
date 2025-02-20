@@ -108,15 +108,21 @@ def main(args : argparse.Namespace):
         if "ip" in d[1]["configuration"]:
           ip = d[1]["configuration"]["ip"]
 
-        node.devices.append(NetworkDevice(d[1]["logicalname"], d[0], int(k), d[1]["product"], mac, ip))
+        if "logicalname" in d[1]:
+          name = d[1]["logicalname"]
+        else:
+          name = d[1]["id"] # logical names are missing if hugepages are setup for the 100G NICs
+
+        node.devices.append(NetworkDevice(name, d[0], int(k), d[1]["product"], mac, ip))
       elif "nvme" in d[1]["id"]:
         node.devices.append(NVMe(d[1]["logicalname"].split("/")[-1], d[0], int(k), d[1]["product"]))
       else:
         node.devices.append(NUMADevice(d[1], d[0], int(k), d[1]))
 
     host.numa.append(node)
-  print(host)
 
+  for n in host.numa:
+    print(n.devices)
   return
 
 
