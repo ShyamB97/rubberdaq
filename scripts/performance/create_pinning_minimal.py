@@ -12,10 +12,6 @@ Description: Create a cpu pinning file for a readout server.
 #! quick way is to pass the script a template pinning file with thread names (and rte-worker-threads), script then assigns the core numbers appropriately
 #! correct way is to read in OKS file, somehow infer names from the configuration (unclear how) and create json file.
 
-#! rte-worker and raw processors are linked in some way (not exposed in the configurtion). This is needed to ensure rtes and raw procs are in the same l3 domain.
-
-#! tpproc, parent and ccp should be in l3 domain other than rawprocs, rtes and recording
-
 """
 import argparse
 import copy
@@ -229,6 +225,9 @@ def assign_cores(core_map : CoreMap, cores : list[Element], max_cores : int) -> 
 
 
 def fill_piining_map_cache(pinning : dict, max_cores : dict, core_map : CoreMap) -> dict:
+    #* rte-worker and raw processors are linked in some way (not exposed in the configurtion). This is needed to ensure rtes and raw procs are in the same l3 domain.
+    #* tpproc, parent and ccp should be in l3 domain other than rawprocs, rtes and recording
+
     # First exclude the first core (first two processing units) in each numa region
     for n in core_map.numa.elements:
         core_map.core.get_id(min([c.id for c in n.get_type("Core")]))
